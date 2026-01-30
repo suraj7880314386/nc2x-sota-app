@@ -6,14 +6,14 @@ from torchvision import transforms
 from torch_geometric.data import Data
 from tqdm import tqdm
 
-# Settings
+
 DEVICE = 'cuda'
 DATA_ROOT = '../data/coco/val2017'
 ANN_FILE = '../data/coco/annotations/instances_val2017.json'
 SAVE_DIR = '../data/coco/processed_val_data'
 os.makedirs(SAVE_DIR, exist_ok=True)
 
-# Models
+
 yolo = YOLO('yolo11x.pt').to(DEVICE)
 backbone = timm.create_model('convnextv2_large.fcmae_ft_in22k_in1k', pretrained=True, num_classes=0, global_pool='avg').eval().to(DEVICE)
 
@@ -21,7 +21,7 @@ coco = COCO(ANN_FILE)
 ids = list(coco.imgs.keys())
 transform = transforms.Compose([transforms.Resize((224, 224)), transforms.ToTensor(), transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
 
-print(f"🚀 Pre-calculating features for {len(ids)} Validation images...")
+print(f"Pre-calculating features for {len(ids)} Validation images...")
 
 with torch.no_grad():
     for img_id in tqdm(ids):
@@ -44,7 +44,7 @@ with torch.no_grad():
         else:
             node_feats = []
             for box in boxes:
-                # Yahan tuple() add kiya gaya hai
+
                 crop_img = img.crop(tuple(map(int, box)))
                 crop_tensor = transform(crop_img).unsqueeze(0).to(DEVICE)
                 node_feats.append(backbone(crop_tensor).cpu().squeeze(0))
@@ -53,7 +53,7 @@ with torch.no_grad():
             adj = torch.ones(len(boxes), len(boxes)) - torch.eye(len(boxes))
             edge_index = adj.nonzero(as_tuple=False).t().contiguous()
             
-        # Target labels code waisa hi rahega...
+        
         cat_ids = coco.getCatIds()
         target = torch.zeros(len(cat_ids), dtype=torch.float32)
         anns = coco.loadAnns(coco.getAnnIds(imgIds=img_id))
