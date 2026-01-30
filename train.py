@@ -9,8 +9,7 @@ import os, glob
 from dataset import FastNC2XDataset
 from model import NC2X_TrainerModel
 
-# --- A6000 ULTRA CONFIG ---
-# Kyunki sirf GNN train ho raha hai, hum BATCH_SIZE 512+ kar sakte hain!
+
 BATCH_SIZE = 512       
 EPOCHS = 100
 LEARNING_RATE = 1e-3   
@@ -24,7 +23,7 @@ def collate_fn(batch):
     return torch.stack(gx), Batch.from_data_list(graphs), torch.stack(y)
 
 def train():
-    print(f"🚀 Training on {DEVICE} with Batch Size: {BATCH_SIZE}")
+    print(f"Training on {DEVICE} with Batch Size: {BATCH_SIZE}")
     
     dataset = FastNC2XDataset(data_dir=PROCESSED_DIR)
     loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, collate_fn=collate_fn)
@@ -32,15 +31,15 @@ def train():
     model = NC2X_TrainerModel().to(DEVICE)
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
     criterion = nn.BCEWithLogitsLoss()
-    scaler = torch.amp.GradScaler('cuda') # For speed
+    scaler = torch.amp.GradScaler('cuda') 
 
-    # --- 🔄 AUTO-RESUME LOGIC ---
+    
     start_epoch = 0
     existing_models = glob.glob(f"{SAVE_DIR}/nc2x_sota_epoch_*.pth")
     if existing_models:
         latest_model = max(existing_models, key=lambda x: int(x.split('_')[-1].split('.')[0]))
         start_epoch = int(latest_model.split('_')[-1].split('.')[0])
-        print(f"✅ Resuming from Epoch {start_epoch}")
+        print(f"Resuming from Epoch {start_epoch}")
         model.load_state_dict(torch.load(latest_model, weights_only=True))
 
     for epoch in range(start_epoch, EPOCHS):
@@ -63,10 +62,10 @@ def train():
             total_loss += loss.item()
             loop.set_postfix(loss=loss.item())
 
-        # Save Checkpoint
+      
         save_path = f"{SAVE_DIR}/nc2x_sota_epoch_{epoch+1}.pth"
         torch.save(model.state_dict(), save_path)
-        print(f"💾 Saved: {save_path}")
+        print(f"Saved: {save_path}")
 
 if __name__ == "__main__":
     train()
