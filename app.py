@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torchvision.models as models
 from torchvision import transforms
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
 from torch_geometric.data import Data, Batch
 from torch_geometric.nn import GCNConv, global_mean_pool
 from PIL import Image
@@ -14,39 +15,39 @@ import tempfile
 from streamlit_agraph import agraph, Node, Edge, Config
 from pytorch_grad_cam import GradCAM
 from pytorch_grad_cam.utils.image import show_cam_on_image
-import timm  # NEW: Added for ConvNeXt-V2
-
-# --- Page Config ---
-st.set_page_config(page_title="NC2X: SOTA AI (RTX A6000)", layout="wide", page_icon="🧠")
+import timm
+import graphviz
+import av
 
 st.markdown("""
     <style>
-        /* 1. Scrollbar fix */
-        .stApp { overflow-y: scroll; }
-        
-        /* 2. Padding adjustment */
-        .block-container { padding-top: 2rem; padding-bottom: 2rem; }
-        
-        /* 3. Hide header/footer */
-        header {visibility: hidden;}
-        footer {visibility: hidden;}
-        
-        /* 4. Smooth images */
-        img { transition: none; }
+        [data-testid="stSidebarNav"] {
+            background-color: #1E1E1E;
+        }
+        .st-emotion-cache-hp888p { 
+            font-size: 25px; 
+            color: #FF5722 !important;
+            font-weight: bold;
+        }
+        .sidebar-hint {
+            position: fixed;
+            top: 10px;
+            left: 10px;
+            z-index: 999;
+            background: #FF5722;
+            color: white;
+            padding: 5px 10px;
+            border-radius: 5px;
+            font-size: 12px;
+        }
     </style>
+    <div class="sidebar-hint">Tip: Use the arrow at the top-left to toggle the menu</div>
 """, unsafe_allow_html=True)
 
-# --- Title & Hardware Info ---
-st.title("NC2X: Neuro-Symbolic Concept Explanation (SOTA V2)")
-if torch.cuda.is_available():
-    st.caption(f"🚀 Running on **{torch.cuda.get_device_name(0)}** with **YOLO11x** & **ConvNeXt-V2 Large**")
-else:
-    st.caption("⚠️ Running on CPU (Performance restricted)")
+st.title("NC2X: Concept, Causal & Context-Aware AI")
 
-# --- Constants & Paths ---
-MODEL_PATH = 'models/nc2x_model_epoch_30.pth'
+MODEL_PATH = 'nc2x_sota_epoch_100.pth'
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 COCO_CLASSES = [
     'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat', 'traffic light',
     'fire hydrant', 'stop sign', 'parking meter', 'bench', 'bird', 'cat', 'dog', 'horse', 'sheep', 'cow',
@@ -59,438 +60,365 @@ COCO_CLASSES = [
     'hair drier', 'toothbrush'
 ]
 
-# --- Model Architectures ---
-
 class NC2X_Model(nn.Module):
-    """
-    Graph Neural Network for reasoning (keeps compatibility with your trained weights)
-    """
-    def __init__(self, num_classes=80, feature_dim=2048, hidden_dim=512):
+    def __init__(self, num_classes=80, feature_dim=1536, hidden_dim=1024):
         super(NC2X_Model, self).__init__()
-        try: resnet = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
-        except: resnet = models.resnet50(pretrained=True)
-        self.concept_extractor = nn.Sequential(*list(resnet.children())[:-1])
         self.gnn1 = GCNConv(feature_dim, hidden_dim)
         self.gnn2 = GCNConv(hidden_dim, hidden_dim)
-        self.fusion_layer = nn.Linear(feature_dim + hidden_dim, hidden_dim)
-        self.final_predictor = nn.Linear(hidden_dim, num_classes)
         self.relu = nn.ReLU()
-    
-    def forward(self, image_tensor, graph_batch):
-        with torch.no_grad():
-            global_features = self.concept_extractor(image_tensor)
-            global_features = global_features.view(global_features.size(0), -1)
+        self.fusion = nn.Sequential(
+            nn.Linear(feature_dim + hidden_dim, 1024),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(1024, num_classes)
+        )
+
+    def forward(self, global_x, graph_batch):
         x, edge_index, batch = graph_batch.x, graph_batch.edge_index, graph_batch.batch
         x = self.relu(self.gnn1(x, edge_index))
         x = self.relu(self.gnn2(x, edge_index))
         graph_features = global_mean_pool(x, batch)
-        combined_features = torch.cat([global_features, graph_features], dim=1)
-        fused = self.relu(self.fusion_layer(combined_features))
-        return self.final_predictor(fused)
+        combined = torch.cat([global_x, graph_features], dim=1)
+        return self.fusion(combined)
 
-# --- Resource Loading (Cached for Speed) ---
 @st.cache_resource
 def load_resources():
-    with st.spinner("Loading SOTA Models (YOLO11x, ConvNeXt-V2)..."):
-        # 1. Detection Upgrade: YOLO11x (State-of-the-art)
-        # Note: Will auto-download yolo11x.pt on first run
-        yolo = YOLO('yolo11x.pt') 
-        
-        # 2. Context Upgrade: ConvNeXt-V2 Large
-        convnext = timm.create_model('convnextv2_large.fcmae_ft_in22k_in1k', pretrained=True)
-        convnext = convnext.to(DEVICE).eval()
+    yolo = YOLO('yolo11x.pt')
+    backbone = timm.create_model('convnextv2_large.fcmae_ft_in22k_in1k', 
+                                 pretrained=True, num_classes=0, global_pool='avg')
+    backbone = backbone.to(DEVICE).eval()
+    resnet = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1).to(DEVICE).eval()
+    nc2x = NC2X_Model(num_classes=80, feature_dim=1536, hidden_dim=1024).to(DEVICE)
+    
+    msg = "System Ready"
+    if os.path.exists(MODEL_PATH):
+        try:
+            nc2x.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
+            msg = "NC2X System Ready!"
+        except Exception as e:
+            msg = f"Weights Error: {e}"
+    else:
+        msg = "Running in Zero-shot Mode (Weights Missing)"
+    
+    nc2x.eval()
+    return yolo, backbone, resnet, nc2x, msg
 
-        # 3. Traditional Model (ResNet50) for Grad-CAM & GNN Feats
-        try: res = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
-        except: res = models.resnet50(pretrained=True)
-        res = res.to(DEVICE).eval()
-        extractor = nn.Sequential(*list(res.children())[:-2]).eval().to(DEVICE)
-        
-        # 4. Custom NC2X GNN Logic
-        nc2x = NC2X_Model(num_classes=80).to(DEVICE)
-        msg = "Initializing..."
-        if os.path.exists(MODEL_PATH):
-            try:
-                state_dict = torch.load(MODEL_PATH, map_location=DEVICE)
-                new_state_dict = {}
-                for k, v in state_dict.items():
-                    if k.startswith('module.'): k = k[7:]
-                    new_state_dict[k] = v
-                nc2x.load_state_dict(new_state_dict, strict=False)
-                msg = "SOTA System Ready!"
-            except Exception as e:
-                msg = f"Error loading weights: {e}"
-        else:
-            msg = f"Weights not found, running in Inference Mode."
-            
-        nc2x.eval()
-        return yolo, convnext, res, extractor, nc2x, msg
+yolo, backbone, resnet_comp, nc2x_model, status_msg = load_resources()
 
-# Load all models
-yolo_model, convnext_model, resnet_model, feature_extractor, nc2x_gnn, status_msg = load_resources()
-
-# Sidebar Status
-if "Ready" in status_msg or "Success" in status_msg:
-    st.sidebar.success(status_msg)
-else:
-    st.sidebar.warning(status_msg)
-
-# --- Helper Functions ---
+st.sidebar.success(status_msg)
+if torch.cuda.is_available():
+    st.sidebar.info(f"Hardware: {torch.cuda.get_device_name(0)}")
 
 def render_knowledge_graph(labels, width=600, height=300):
-    nodes = []
-    edges = []
-    unique_labels = []
-    for l in labels:
-        if isinstance(l, int) and l < len(COCO_CLASSES): 
-            unique_labels.append(COCO_CLASSES[l])
-        elif isinstance(l, str):
-            unique_labels.append(l)
-    
-    unique_labels = list(set(unique_labels))
+    nodes, edges = [], []
+    unique_labels = list(set([COCO_CLASSES[l] if isinstance(l, int) else l for l in labels]))
     if not unique_labels: return
-
-    nodes.append(Node(id="SCENE", label="CONTEXT", size=25, color="#FF5722", shape="diamond"))
     
-    for i, name in enumerate(unique_labels):
-        node_id = f"{name}_{i}"
-        nodes.append(Node(id=node_id, label=name, size=20, color="#03A9F4", shape="dot"))
-        edges.append(Edge(source=node_id, target="SCENE", color="#bdc3c7", label="part_of"))
-        
-        # Connect nodes to each other to show relationship
-        if i > 0:
-            prev_node = f"{unique_labels[i-1]}_{i-1}"
-            edges.append(Edge(source=prev_node, target=node_id, color="#ecf0f1", type="curvedCW"))
-
-    config = Config(width=width, height=height, directed=False, physics=True, hierarchy=False)
+    nodes.append(Node(id="SCENE", label="CONTEXT", size=25, color="#FF5722", shape="diamond"))
+    for name in unique_labels:
+        nodes.append(Node(id=name, label=name, size=20, color="#03A9F4"))
+        edges.append(Edge(source=name, target="SCENE", color="#bdc3c7"))
+    
+    config = Config(width=width, height=height, directed=False, physics=True)
     return agraph(nodes=nodes, edges=edges, config=config)
 
 def predict(image):
-    """
-    Main inference pipeline using YOLO11x + NC2X GNN
-    """
-    # 1. Detection with YOLO11x (Threshold 0.4 for high precision)
-    results = yolo_model(image, conf=0.4, verbose=False)[0]
+    results = yolo(image, conf=0.4, verbose=False)[0]
     boxes = results.boxes.xyxy.cpu()
     labels = results.boxes.cls.cpu().int().tolist()
-
-    # 2. Graph Construction for GNN
-    if len(boxes) == 0:
-        node_features = torch.zeros(1, 2048, device=DEVICE)
-        edge_index = torch.empty((2, 0), dtype=torch.long, device=DEVICE)
-    else:
-        t_feat = transforms.Compose([
-            transforms.Resize((224, 224)), 
-            transforms.ToTensor(), 
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-        with torch.no_grad():
-            img_tensor = t_feat(image.convert('RGB')).unsqueeze(0).to(DEVICE)
-            # Use ResNet extractor for GNN compatibility
-            f_map = feature_extractor(img_tensor)
-            feats = []
-            for _ in boxes: feats.append(f_map.mean([2, 3]).squeeze(0))
-            node_features = torch.stack(feats)
-            num_nodes = len(boxes)
-            # Fully connected graph
-            adj = torch.ones(num_nodes, num_nodes) - torch.eye(num_nodes)
-            edge_index = adj.nonzero(as_tuple=False).t().contiguous().to(DEVICE)
-
-    # 3. GNN Inference
-    graph_data = Data(x=node_features, edge_index=edge_index)
-    batch = Batch.from_data_list([graph_data]).to(DEVICE)
-    t_img = transforms.Compose([
-        transforms.Resize((224, 224)), 
-        transforms.ToTensor(), 
+    
+    t_feat = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     
     with torch.no_grad():
-        out = nc2x_gnn(t_img(image.convert('RGB')).unsqueeze(0).to(DEVICE), batch)
-        probs = torch.sigmoid(out).flatten().cpu().numpy()
+        img_t = t_feat(image.convert('RGB')).unsqueeze(0).to(DEVICE)
+        global_x = backbone(img_t)
         
-    return probs, boxes, labels
+        if len(boxes) == 0:
+            node_features = torch.zeros(1, 1536, device=DEVICE)
+            edge_index = torch.empty((2, 0), dtype=torch.long, device=DEVICE)
+        else:
+            node_feats = []
+            for box in boxes:
+                crop = image.crop(tuple(map(int, box)))
+                node_feats.append(backbone(t_feat(crop).unsqueeze(0).to(DEVICE)).squeeze(0))
+            node_features = torch.stack(node_feats)
+            num_nodes = len(boxes)
+            adj = torch.ones(num_nodes, num_nodes) - torch.eye(num_nodes)
+            edge_index = adj.nonzero(as_tuple=False).t().contiguous().to(DEVICE)
+            
+        batch = Batch.from_data_list([Data(x=node_features, edge_index=edge_index)]).to(DEVICE)
+        out = nc2x_model(global_x, batch)
+        probs = torch.sigmoid(out).flatten().cpu().numpy()
+        return probs, boxes, labels
 
-# --- Main App Navigation ---
+class SOTAVideoProcessor(VideoProcessorBase):
+    def __init__(self):
+        self.detected_items = []
+        self.frame_count = 0
+
+    def recv(self, frame):
+        self.frame_count += 1
+        img = frame.to_ndarray(format="bgr24")
+        
+        if self.frame_count % 10 == 0:
+            pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            probs, boxes, labels = predict(pil_img)
+            
+            current_detected = []
+            for i, box in enumerate(boxes):
+                x1, y1, x2, y2 = map(int, box)
+                name = COCO_CLASSES[labels[i]]
+                current_detected.append(name)
+                cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(img, name, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (36, 255, 12), 2)
+            
+            self.detected_items = list(set(current_detected))
+
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 app_mode = st.sidebar.selectbox("Choose Mode", [
-    "Image Analysis", 
-    "Video Analysis", 
-    "Live Webcam", 
-    "Causal Experiment",
-    "Comparison (vs Grad-CAM)"
+    "Image Analysis", "Video Analysis", "Live Webcam", "Causal Experiment", "Comparison (vs Grad-CAM)"
 ])
 
-# ==========================================
-# 1. IMAGE ANALYSIS
-# ==========================================
 if app_mode == "Image Analysis":
-    st.header("Image Analysis & Scene Graph (YOLO11x)")
+    st.header("Scene Graph Analysis")
     uploaded_file = st.file_uploader("Upload Image", type=['jpg', 'png', 'jpeg'])
-
     if uploaded_file:
         image = Image.open(uploaded_file).convert('RGB')
-        col1, col2, col3 = st.columns([1, 1, 1.5])
-        
+        col1, col2, col3 = st.columns([1, 1, 1.2])
         with col1: st.image(image, caption="Original", use_container_width=True)
         
         if st.button("Analyze Scene"):
-            with st.spinner("Processing on RTX A6000..."):
+            with st.spinner("Processing..."):
                 probs, boxes, labels = predict(image)
-                
-                # Visualization
-                img_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+                img_draw = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
                 for i, box in enumerate(boxes):
                     x1,y1,x2,y2 = map(int, box)
-                    if labels[i] < len(COCO_CLASSES):
-                        cv2.rectangle(img_cv, (x1,y1), (x2,y2), (0,255,0), 2)
-                        cv2.putText(img_cv, COCO_CLASSES[labels[i]], (x1, y1-10), 0, 0.9, (36,255,12), 2)
+                    cv2.rectangle(img_draw, (x1,y1), (x2,y2), (0,255,0), 2)
+                    cv2.putText(img_draw, COCO_CLASSES[labels[i]], (x1, y1-10), 0, 0.8, (36,255,12), 2)
                 
                 with col2:
-                    st.image(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB), caption="YOLO11x Detection", use_container_width=True)
-                    st.subheader("Top Concepts")
+                    st.image(cv2.cvtColor(img_draw, cv2.COLOR_BGR2RGB), caption="YOLOv11 Analysis", use_container_width=True)
+                    st.subheader("Detected Concepts")
                     for i in np.argsort(probs)[-5:][::-1]:
-                        score = float(probs[i])
-                        st.write(f"**{COCO_CLASSES[i]}**: {score:.0%}")
-                        st.progress(min(score, 1.0))
-
+                        st.write(f"**{COCO_CLASSES[i]}**: {probs[i]:.0%}")
                 with col3:
-                    st.subheader("Visual Scene Graph")
-                    render_knowledge_graph(labels, height=350)
+                    st.subheader("Knowledge Graph")
+                    render_knowledge_graph(labels)
 
-# ==========================================
-# 2. VIDEO ANALYSIS
-# ==========================================
 elif app_mode == "Video Analysis":
-    st.header("Video Analysis (SOTA)")
-    video_file = st.file_uploader("Upload Video", type=['mp4', 'avi'])
-    if video_file:
-        tfile = tempfile.NamedTemporaryFile(delete=False)
-        tfile.write(video_file.read())
-        cap = cv2.VideoCapture(tfile.name)
-        col1, col2 = st.columns([2, 1])
-        with col1: stframe = st.empty()
-        with col2: 
-            st.subheader("Live Stats")
-            stats_ph = st.empty()
-
-        if st.button("Start Video"):
+    st.header("Video Processing")
+    st.info("Performance Note: Processing every 5th frame for optimization.")
+    v_file = st.file_uploader("Upload Video", type=['mp4', 'avi'])
+    
+    if v_file:
+        tfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+        tfile.write(v_file.read())
+        tfile.close()
+        
+        if st.button("Start Processing"):
+            col_left, col_right = st.columns([2, 1])
+            with col_left: st_frame = st.empty()
+            with col_right:
+                st.subheader("Active Detections")
+                st_list = st.empty()
+            
+            st_status = st.info("Initializing analysis engine...")
+            cap = cv2.VideoCapture(tfile.name)
+            frame_idx = 0
+            
             while cap.isOpened():
                 ret, frame = cap.read()
                 if not ret: break
-                frame = cv2.resize(frame, (640, 360))
-                pil_img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                probs, boxes, labels = predict(pil_img)
                 
-                for i, box in enumerate(boxes):
-                    x1,y1,x2,y2 = map(int, box)
-                    if labels[i] < len(COCO_CLASSES):
-                        cv2.rectangle(frame, (x1,y1), (x2,y2), (0,255,0), 2)
-                        cv2.putText(frame, COCO_CLASSES[labels[i]], (x1, y1-5), 0, 0.5, (0,255,0), 1)
-                stframe.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), channels="RGB")
-                
-                # Optional: Slow down slightly to display
-                # time.sleep(0.03) 
-                
-        cap.release()
-
-# ==========================================
-# 3. LIVE WEBCAM
-# ==========================================
-elif app_mode == "Live Webcam":
-    st.header("Live Webcam (Real-time YOLO11x)")
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        run = st.checkbox('Start Camera')
-        FRAME_WINDOW = st.image([])
-    with col2:
-        st.subheader("Live Stats")
-        stats_ph = st.empty()
-
-    if run:
-        cap = cv2.VideoCapture(0)
-        while run:
-            ret, frame = cap.read()
-            if not ret: break
-            pil_img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            probs, boxes, labels = predict(pil_img)
-            
-            for i, box in enumerate(boxes):
-                x1,y1,x2,y2 = map(int, box)
-                if labels[i] < len(COCO_CLASSES):
-                    cv2.rectangle(frame, (x1,y1), (x2,y2), (0,255,0), 2)
-                    cv2.putText(frame, COCO_CLASSES[labels[i]], (x1, y1-5), 0, 0.5, (0,255,0), 1)
-            FRAME_WINDOW.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        cap.release()
-
-# ==========================================
-# 4. CAUSAL EXPERIMENT
-# ==========================================
-elif app_mode == "Causal Experiment":
-    st.header("Causal Analysis & Reasoning Engine")
-    st.markdown("**What is this?** We use YOLO11x accurate boxes to remove objects and test context dependency.")
-    
-    file = st.file_uploader("Upload Image", type=['jpg', 'png'])
-    if file:
-        image = Image.open(file).convert('RGB')
-        
-        with st.spinner("Analyzing original scene..."):
-            orig_probs, orig_boxes, orig_labels = predict(image)
-        
-        detected_names = sorted(list(set([COCO_CLASSES[i] for i in orig_labels if i < len(COCO_CLASSES)])))
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.subheader("1. Original Observation")
-            st.image(image, caption="Original Image", use_container_width=True)
-            st.write("**Detected Objects:** " + ", ".join(detected_names))
-        
-        with col2:
-            st.subheader("2. Formulate Hypothesis")
-            if not detected_names:
-                st.warning("No objects detected to remove.")
-            else:
-                remove_name = st.selectbox("I want to REMOVE (Cause):", detected_names, key='rem')
-                
-                all_indices_of_removal = [i for i, lbl in enumerate(orig_labels) if COCO_CLASSES[lbl] == remove_name]
-                total_count = len(all_indices_of_removal)
-                
-                num_to_remove = 1
-                if total_count > 1:
-                    num_to_remove = st.slider(f"How many {remove_name}s to remove?", 1, total_count, total_count)
-                
-                # Target selection
-                possible_targets = [n for n in detected_names if n != remove_name]
-                if not possible_targets:
-                    st.info("Need at least two different types of objects for relation test.")
-                    run_btn = False
-                else:
-                    target_name = st.selectbox("I want to OBSERVE (Effect on):", possible_targets, key='tar')
-                    target_idx = COCO_CLASSES.index(target_name)
-                    orig_score = orig_probs[target_idx]
+                if frame_idx % 5 == 0:
+                    frame = cv2.resize(frame, (480, 270))
+                    pil_img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                    _, boxes, labels = predict(pil_img)
                     
-                    st.markdown(f"**Baseline:** NC2X is **{orig_score:.2%}** sure about **{target_name}**.")
-                    run_btn = st.button("Run Causal Intervention")
+                    current_frame_objects = []
+                    for i, box in enumerate(boxes):
+                        x1, y1, x2, y2 = map(int, box)
+                        obj_name = COCO_CLASSES[labels[i]]
+                        current_frame_objects.append(obj_name)
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        cv2.putText(frame, obj_name, (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                    
+                    st_frame.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), caption=f"Processing Frame: {frame_idx}")
+                    unique_objects = list(set(current_frame_objects))
+                    if unique_objects:
+                        obj_list_text = "\n".join([f" **{obj}**" for obj in unique_objects])
+                        st_list.markdown(obj_list_text)
+                    else:
+                        st_list.write("Scanning frame...")
+                frame_idx += 1
+            cap.release()
+            st_status.success("Video analysis complete.")
+            os.unlink(tfile.name)
 
-        if run_btn:
-            st.divider()
-            st.subheader("3. Experimental Results")
-            
-            indices_to_mask = all_indices_of_removal[:num_to_remove]
-            img_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-            remaining_labels = []
-            
-            # Inpainting / Masking
-            for i, lbl in enumerate(orig_labels):
-                if i in indices_to_mask:
-                    x1,y1,x2,y2 = map(int, orig_boxes[i])
-                    # Fill with black or average color (simple removal)
-                    cv2.rectangle(img_cv, (x1,y1), (x2,y2), (128,128,128), -1) 
-                else:
-                    remaining_labels.append(lbl)
-            
-            masked_pil = Image.fromarray(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
-            new_probs, _, _ = predict(masked_pil)
-            new_score = new_probs[target_idx]
-            
-            drop = (orig_score - new_score) / orig_score * 100 if orig_score > 0.01 else 0
-            
-            res_col1, res_col2, res_col3 = st.columns([1, 1, 1.5])
-            
-            with res_col1:
-                st.image(masked_pil, caption=f"Intervention: Removed {remove_name}", use_container_width=True)
-            
-            with res_col2:
-                st.metric(label=f"Original {target_name}", value=f"{orig_score:.4f}")
-                st.metric(label=f"New {target_name}", value=f"{new_score:.4f}", delta=f"-{drop:.2f}% Drop", delta_color="inverse")
-            
-            with res_col3:
-                if drop > 5.0:
-                    st.error(f"**Significant Dependency!**\n\nThe model relies on **{remove_name}** to recognize **{target_name}**.")
-                else:
-                    st.success(f"**Independent Concepts.**\n\nRemoving **{remove_name}** did not significantly confuse the model about **{target_name}**.")
+elif app_mode == "Live Webcam":
+    st.header("Live Symbolic Inference")
+    st.info("Snapshot mode is utilized for stability when running complex models.")
+
+    col_v, col_l = st.columns([1.5, 1])
+
+    with col_v:
+        img_file = st.camera_input("Take a snapshot for analysis")
+
+    with col_l:
+        st.subheader("Detection Results")
+        if img_file:
+            with st.spinner("Analyzing snapshot..."):
+                input_img = Image.open(img_file).convert('RGB')
+                probs, boxes, labels = predict(input_img)
                 
-                render_knowledge_graph(remaining_labels, height=200)
+                for lbl in labels:
+                    st.success(f"Detected: **{COCO_CLASSES[lbl]}**")
+                
+                st.write("---")
+                st.write("**Knowledge Graph:**")
+                render_knowledge_graph(labels, height=250)
+        else:
+            st.warning("Please capture a snapshot to trigger symbolic reasoning.")
 
-# ==========================================
-# 5. COMPARISON (SOTA UPDATE)
-# ==========================================
-elif app_mode == "Comparison (vs Grad-CAM)":
-    st.header("Comparative Analysis: SOTA NC2X vs Traditional AI")
-    file = st.file_uploader("Upload Image for Comparison", type=['jpg', 'png'])
+elif app_mode == "Causal Experiment":
+    st.header("Causal Reasoning & Intervention Engine")
+    
+    st.info("""
+    **Methodology:** We are testing the model's robustness by manually removing symbolic nodes (objects). 
+    This allows us to observe how much the AI relies on context vs. direct visual features.
+    """)
+    
+    file = st.file_uploader("Upload Image to Begin Experiment", type=['jpg', 'png', 'jpeg'])
     
     if file:
         image = Image.open(file).convert('RGB')
-        col1, col2 = st.columns(2)
-        with col1: st.image(image, caption="Original Image", use_container_width=True)
         
-        if st.button("Run Comparison (RTX A6000 Power)"):
-            with st.spinner("Generating SOTA Explanations with YOLO11x & ConvNeXt-V2..."):
+        if 'causal_data' not in st.session_state:
+            st.subheader("Step 1: Baseline Observation")
+            if st.button("Run Initial Scene Analysis"):
+                with st.spinner("Performing baseline analysis..."):
+                    orig_probs, orig_boxes, orig_labels = predict(image)
+                    st.session_state.causal_data = {
+                        'probs': orig_probs,
+                        'boxes': orig_boxes,
+                        'labels': orig_labels,
+                        'names': sorted(list(set([COCO_CLASSES[i] for i in orig_labels if i < len(COCO_CLASSES)])))
+                    }
+                    st.rerun()
+        
+        if 'causal_data' in st.session_state:
+            data = st.session_state.causal_data
+            col_img, col_setup = st.columns([1.2, 1])
+            
+            with col_img:
+                st.image(image, caption="Reference Baseline", use_container_width=True)
+                st.write(f"**Identified Concepts:** {', '.join(data['names'])}")
+
+            with col_setup:
+                st.subheader("Step 2: Define Hypothesis")
+                remove_name = st.selectbox("Select object to REMOVE (Cause):", data['names'], key='rem_obj')
                 
-                # --- 1. Traditional AI (Grad-CAM with ResNet) ---
-                target_layers = [resnet_model.layer4[-1]]
-                cam = GradCAM(model=resnet_model, target_layers=target_layers)
+                all_idx = [i for i, lbl in enumerate(data['labels']) if COCO_CLASSES[lbl] == remove_name]
+                total_count = len(all_idx)
                 
+                num_to_remove = st.slider(f"Quantity of '{remove_name}' to hide:", 1, total_count, total_count)
+                
+                targets = [n for n in data['names'] if n != remove_name]
+                target_name = st.selectbox("Observe impact on (Effect):", targets if targets else ["No other objects"], key='tar_obj')
+                
+                if target_name != "No other objects":
+                    target_idx = COCO_CLASSES.index(target_name)
+                    orig_score = data['probs'][target_idx]
+                    
+                    st.markdown(f"**Hypothesis:** If I hide **{num_to_remove} {remove_name}(s)**, the confidence in identifying the **{target_name}** will change.")
+                    st.write(f"**Current Confidence:** `{orig_score:.4%}`")
+                    
+                    run_trigger = st.button("Run Causal Intervention")
+
+            if 'run_trigger' in locals() and run_trigger:
+                st.divider()
+                st.subheader("Step 3: Intervention Results")
+                
+                with st.spinner("Calculating impact of intervention..."):
+                    indices_to_mask = all_idx[:num_to_remove]
+                    img_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+                    remaining_labels = []
+                    
+                    for i, lbl in enumerate(data['labels']):
+                        if i in indices_to_mask:
+                            x1, y1, x2, y2 = map(int, data['boxes'][i])
+                            cv2.rectangle(img_cv, (x1, y1), (x2, y2), (15, 15, 15), -1)
+                            cv2.putText(img_cv, "HIDDEN", (x1+5, y1+20), 0, 0.6, (255,255,255), 2)
+                        else:
+                            remaining_labels.append(lbl)
+                    
+                    intervened_img = Image.fromarray(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
+                    new_probs, _, _ = predict(intervened_img)
+                    new_score = new_probs[target_idx]
+                    
+                    diff = orig_score - new_score
+                    drop_percent = (diff / orig_score) * 100 if orig_score > 0 else 0
+                    
+                    res_c1, res_c2, res_c3 = st.columns([1.2, 1, 1.5])
+                    
+                    with res_c1:
+                        st.image(intervened_img, caption="Modified Context", use_container_width=True)
+                    
+                    with res_c2:
+                        st.metric(label=f"Baseline {target_name}", value=f"{orig_score:.2%}")
+                        st.metric(label=f"Intervention Confidence", value=f"{new_score:.2%}", 
+                                  delta=f"{drop_percent:+.4f}% Change", delta_color="inverse")
+                    
+                    with res_c3:
+                        st.markdown("### Experimental Results")
+                        st.info(f"Hiding {num_to_remove} {remove_name} nodes resulted in a {abs(drop_percent):.4f}% shift in recognition confidence for the target {target_name}.")
+
+                        st.markdown("### Reasoning Logic")
+                        if abs(drop_percent) < 0.01:
+                            st.success(f"**Result: Model Robustness.** The NC2X model is stable. Identifying the {target_name} does not rely on the presence of {remove_name}.")
+                        elif drop_percent > 2:
+                            st.error(f"**Result: Contextual Dependency.** The AI uses {remove_name} as contextual proof to verify the identity of the {target_name}.")
+                        else:
+                            st.warning("Minor context dependence observed.")
+                        
+                        st.write("---")
+                        st.write("**Updated Symbolic Graph:**")
+                        render_knowledge_graph(remaining_labels)
+
+            st.sidebar.button("Clear Experiment Data", on_click=lambda: st.session_state.pop('causal_data', None))
+
+elif app_mode == "Comparison (vs Grad-CAM)":
+    st.header("Grad-CAM vs NC2X Benchmark")
+    file = st.file_uploader("Upload Image", type=['jpg', 'png', 'jpeg'])
+    if file:
+        image = Image.open(file).convert('RGB')
+        if st.button("Compare Architectures"):
+            with st.spinner("Generating heatmaps..."):
+                target_layers = [resnet_comp.layer4[-1]]
+                cam = GradCAM(model=resnet_comp, target_layers=target_layers)
                 t_cam = transforms.Compose([
                     transforms.Resize((224, 224)), 
                     transforms.ToTensor(), 
-                    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+                    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
                 ])
-                input_tensor = t_cam(image).unsqueeze(0).to(DEVICE)
+                grayscale_cam = cam(input_tensor=t_cam(image).unsqueeze(0).to(DEVICE))[0, :]
+                heatmap_vis = show_cam_on_image(np.array(image.resize((224,224)))/255.0, grayscale_cam, use_rgb=True)
                 
-                grayscale_cam = cam(input_tensor=input_tensor, targets=None)
-                grayscale_cam = grayscale_cam[0, :]
-                
-                img_np = np.array(image.resize((224, 224))) / 255.0
-                visualization = show_cam_on_image(img_np, grayscale_cam, use_rgb=True)
-                
-                st.divider()
+                probs, boxes, labels = predict(image)
+                img_nc2x = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+                for i, box in enumerate(boxes):
+                    x1, y1, x2, y2 = map(int, box)
+                    obj_name = COCO_CLASSES[labels[i]]
+                    cv2.rectangle(img_nc2x, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.putText(img_nc2x, obj_name, (x1, y1-10), 0, 0.7, (36, 255, 12), 2)
+
                 c1, c2 = st.columns(2)
-                
-                # --- Display Traditional ---
-                with c1:
-                    st.subheader("Traditional AI (Grad-CAM)")
-                    st.image(visualization, caption="Pixel Heatmap Explanation", use_container_width=True)
-                    st.error("**Limit:** Just colorful blobs. It doesn't tell 'WHY'.")
-                
-                # --- 2. SOTA NC2X Model (YOLO11x + ConvNeXt) ---
-                with c2:
-                    st.subheader("Our NC2X Model (SOTA V2)")
-                    
-                    # A. Context Extraction (ConvNeXt-V2)
-                    with torch.no_grad():
-                        # Passing image through ConvNeXt to assert feature usage
-                        _ = convnext_model(input_tensor) 
-                    
-                    # B. Object Detection (YOLO11x)
-                    results = yolo_model(image, conf=0.35, verbose=False)
-                    
-                    img_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-                    detected = []
-                    
-                    for result in results:
-                        boxes = result.boxes
-                        for box in boxes:
-                            x1,y1,x2,y2 = map(int, box.xyxy[0])
-                            conf = box.conf[0]
-                            cls_id = int(box.cls[0])
-                            name = result.names[cls_id]
-                            
-                            detected.append(name)
-                            # Green Box for NC2X
-                            cv2.rectangle(img_cv, (x1,y1), (x2,y2), (0,255,0), 2)
-                            cv2.putText(img_cv, f"{name} {conf:.2f}", (x1, y1-10), 0, 0.6, (36,255,12), 2)
-                    
-                    st.image(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB), caption="Concept & Graph Explanation (YOLO11x)", use_container_width=True)
-                    
-                    detected = list(set(detected))
-                    
-                    if len(detected) > 1:
-                        st.success(f"**Advantage:** NC2X (via ConvNeXt-V2) understands relationships between **{', '.join(detected[:3])}**.")
-                        render_knowledge_graph(detected, height=200)
-                    elif len(detected) == 1:
-                         st.success(f"**Advantage:** Distinct Concept Node: **{detected[0]}** identified.")
-                         render_knowledge_graph(detected, height=200)
-                    else:
-                        st.warning("No distinct objects found, relying on ConvNeXt global context.")
+                with c1: st.image(heatmap_vis, caption="Grad-CAM (Visual Attention)", use_container_width=True)
+                with c2: 
+                    st.image(cv2.cvtColor(img_nc2x, cv2.COLOR_BGR2RGB), caption="NC2X (Graph Reasoning)", use_container_width=True)
+                    render_knowledge_graph(labels)
