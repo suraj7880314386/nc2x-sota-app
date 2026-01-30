@@ -1,0 +1,14 @@
+streamlit
+torch
+torchvision
+opencv-python-headless
+ultralytics
+timm
+streamlit-agraph
+pytorch-grad-cam
+graphviz
+numpy
+pillow
+torch-geometric
+pandas
+scikit-learn
