@@ -30,7 +30,7 @@ def evaluate():
     y_pred = np.concatenate(all_preds)
     
     print("\n" + "="*30)
-    print("🚀 NC2X V2 FINAL METRICS")
+    print("NC2X V2 FINAL METRICS")
     print("="*30)
     print(f"Precision: {precision_score(y_true, y_pred, average='samples', zero_division=0):.4f}")
     print(f"Recall:    {recall_score(y_true, y_pred, average='samples', zero_division=0):.4f}")
