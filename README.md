@@ -25,6 +25,8 @@ UI: Streamlit
 Server: Hugging Face Spaces (Docker Environment)
 Hardware: Optimized for NVIDIA RTX A6000.
 
+Deploy Project Link: https://huggingface.co/spaces/jdwnx234/NC2X-App
+
 Application Modes
 🖼️ Image Analysis: Full scene breakdown with a dynamic Knowledge Graph.
 🎥 Video Analysis: SOTA detection and symbolic tracking across video frames.
